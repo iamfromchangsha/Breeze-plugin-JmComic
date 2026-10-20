@@ -32,6 +32,17 @@ https://raw.githubusercontent.com/iamfromchangsha/Breeze-plugin-JmComic/main/rel
 https://github.com/iamfromchangsha/Breeze-plugin-JmComic/releases/latest/download/breeze-plugin-jm-comic.bundle.cjs
 ```
 
+> 国内网络如果 raw.githubusercontent 拉不动，App 会自动依次尝试 gh-proxy 镜像；
+> 也可以手动用 jsDelivr CDN（文件与上面完全一致，sha256 相同）：
+
+```
+https://cdn.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@main/release/breeze-plugin-jm-comic.bundle.cjs
+```
+
+```
+https://fastly.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@main/release/breeze-plugin-jm-comic.bundle.cjs
+```
+
 ### 方式 B：本地安装
 
 1. 在 Release 页面下载 `breeze-plugin-jm-comic.bundle.cjs`（或本仓库 `release/` 目录里的文件）
