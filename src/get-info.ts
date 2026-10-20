@@ -35,7 +35,7 @@ export function buildPluginInfo(input: BuildPluginInfoInput) {
     uuid: JM_PLUGIN_ID,
     iconUrl: "https://raw.githubusercontent.com/deretame/Breeze-plugin-JmComic/main/assets/fO.webp",
     describe: "禁漫天堂插件（标签组合搜索增强版）",
-    version: "0.0.16",
+    version: "0.0.17",
     home: "https://github.com/deretame/Breeze-plugin-JmComic",
     updateUrl:
       "https://api.github.com/repos/iamfromchangsha/Breeze-plugin-JmComic/releases/latest",

@@ -1491,18 +1491,22 @@ async function getRankingFilterBundle(): Promise<FilterBundleContract> {
   };
 }
 
-/** 标签组合搜索: 并发拉分页的并发数. */
-const JM_TAG_PAGE_CONCURRENCY = 6;
 /** 禁漫 /search 每页固定条数. */
 const JM_SEARCH_PAGE_SIZE = 80;
-/** 标签组合搜索: 每个检索词首次拉取的条数上限. */
-const JM_TAG_TERM_BUDGET = 8 * JM_SEARCH_PAGE_SIZE;
-/** 标签组合搜索: 结果不够时每次再扩多少条. */
-const JM_TAG_GROW_STEP = 8 * JM_SEARCH_PAGE_SIZE;
-/** 标签组合搜索: 拉取条数上限, 再大就没必要了. */
-const JM_TAG_MAX_BUDGET = 100 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 并发拉分页的并发数(实测 JM 每请求约 450ms, 并发 24 吞吐不降). */
+const JM_TAG_PAGE_CONCURRENCY = 24;
 /** 标签组合搜索: 并发核对本子详情的并发数. */
-const JM_TAG_DETAIL_CONCURRENCY = 8;
+const JM_TAG_DETAIL_CONCURRENCY = 24;
+/** 标签组合搜索: 每个条件词首次拉取的条数(由页预算动态算, 这里只是兜底). */
+const JM_TAG_TERM_BUDGET = 8 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 多条件时总请求数预算(32 个请求 ≈ 1~2 秒). */
+const JM_TAG_PAGE_BUDGET_TOTAL = 32;
+/** 标签组合搜索: 翻页时每个条件词再加深多少条. */
+const JM_TAG_GROW_STEP = 8 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 每个条件词最多拉多少条. */
+const JM_TAG_MAX_BUDGET = 40 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 一页最多核对多少本子的详情. */
+const JM_TAG_VERIFY_BATCH = 48;
 
 type TagTerm = { text: string; mainTag: 0 | 3 };
 
@@ -1538,6 +1542,8 @@ let knownTagIndex: { normalized: Set<string> } | null = null;
 const termListCache = new Map<string, SearchTermList>();
 const albumMetaCache = new Map<string, AlbumSearchFields>();
 const tagSimplifyCache = new Map<string, string>();
+/** 本子是否满足全部条件的核对结果(按 id 缓存), 翻页不用重复拉详情 */
+const tagVerdicts = new Map<string, boolean>();
 
 /** 同步归一化(不含繁简转换). */
 function syncNormalize(value: string): string {
@@ -1678,16 +1684,25 @@ async function loadSearchTermList(
       if (category) {
         params.c = category;
       }
-      const response = (await jmRequest({
-        path: `${await getApiBaseUrl()}/search`,
-        method: "GET",
-        params,
-      })) as Record<string, any>;
-      return response;
+      try {
+        const response = (await jmRequest({
+          path: `${await getApiBaseUrl()}/search`,
+          method: "GET",
+          params,
+        })) as Record<string, any>;
+        return response;
+      } catch (err) {
+        // 单页失败就少这一页, 别让整次搜索报错
+        console.warn("[jm] 拉搜索页失败", term.text, page, err);
+        return null;
+      }
     },
   );
 
   for (const response of responses) {
+    if (!response) {
+      continue;
+    }
     const content = Array.isArray(response?.content) ? response.content : [];
     entry.total = Math.max(entry.total, toNum(response?.total, 0));
     if (content.length === 0) {
@@ -1765,40 +1780,49 @@ async function resolveTagQuery(
   };
 }
 
-/** 逐本核对: 本子是否同时满足所有条件词. */
+/** 逐本核对: 本子是否同时满足所有条件词. 结果按 id 缓存, 翻页不重复核对. */
 async function filterByTagRules(
   candidates: any[],
   terms: string[],
+  verdicts: Map<string, boolean>,
 ): Promise<any[]> {
   if (!candidates.length) {
     return [];
   }
 
-  const metas = await mapWithConcurrency(
-    candidates,
-    JM_TAG_DETAIL_CONCURRENCY,
-    async (item) => {
-      try {
-        return await fetchAlbumMeta(String(item?.id ?? ""));
-      } catch (err) {
-        console.warn("[jm] 拉本子详情失败", err);
-        return null;
-      }
-    },
+  // 只核对这一页要用的那批, 剩下的留给下一页(不然候选一多就慢到没法用)
+  const pending = candidates.filter(
+    (item) => !verdicts.has(String(item?.id ?? "")),
   );
+  const batch = pending.slice(0, JM_TAG_VERIFY_BATCH);
+  if (batch.length > 0) {
+    const metas = await mapWithConcurrency(
+      batch,
+      JM_TAG_DETAIL_CONCURRENCY,
+      async (item) => {
+        try {
+          return await fetchAlbumMeta(String(item?.id ?? ""));
+        } catch (err) {
+          console.warn("[jm] 拉本子详情失败", err);
+          return null;
+        }
+      },
+    );
 
-  const kept: any[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const meta = metas[i];
-    if (!meta) {
-      continue;
+    for (let i = 0; i < batch.length; i++) {
+      const id = String(batch[i]?.id ?? "");
+      const meta = metas[i];
+      if (!id || !meta) {
+        continue;
+      }
+      verdicts.set(
+        id,
+        terms.every((term) => albumMatchesTerm(meta, term, syncNormalize)),
+      );
     }
-    if (!terms.every((term) => albumMatchesTerm(meta, term, syncNormalize))) {
-      continue;
-    }
-    kept.push(candidates[i]);
   }
-  return kept;
+
+  return candidates.filter((item) => verdicts.get(String(item?.id ?? "")) === true);
 }
 
 function toTagSearchPlan(value: unknown): TagSearchPlan | null {
@@ -2238,73 +2262,95 @@ async function runTagSearch(input: {
 
   let plan = toTagSearchPlan(extern.tagSearch);
   if (!plan || plan.key !== planKey) {
-    plan = { key: planKey, terms, budget: JM_TAG_TERM_BUDGET, seen: [] };
+    plan = { key: planKey, terms, budget: 0, seen: [] };
   }
   if (page <= 1) {
     plan.seen = [];
   }
   const seen = new Set(plan.seen);
 
-  let verified: any[] = [];
-  let exhausted = false;
-
-  while (true) {
-    const lists = await Promise.all(
-      terms.map(async (term) => {
-        const list = await loadSearchTermList(
-          term,
-          plan.budget,
-          query.category,
-          order,
-        );
-        if (list.items.length > 0 || term.mainTag !== 3) {
-          return list;
-        }
-        // 标签字段里没有这个词, 退回站内搜索再试一次
-        return loadSearchTermList(
-          { text: term.text, mainTag: 0 },
-          plan.budget,
-          query.category,
-          order,
-        );
-      }),
-    );
-    exhausted = lists.every((list) => list.exhausted);
-
-    const idLists = lists.map((list) =>
-      list.items.map((item) => String(item?.id ?? "")).filter((id) => id.length > 0),
-    );
-    const interIds = intersectIdLists(idLists);
-
-    const itemById = new Map<string, any>();
-    for (const list of lists) {
-      for (const item of list.items) {
-        const id = String(item?.id ?? "");
-        if (id && !itemById.has(id)) {
-          itemById.set(id, item);
-        }
-      }
-    }
-
-    const candidates = interIds
-      .map((id) => itemById.get(id))
-      .filter((item) => Boolean(item));
-
-    verified = await filterByTagRules(candidates, conditionTerms);
-
-    if (
-      verified.some((item) => !seen.has(String(item?.id ?? ""))) ||
-      exhausted ||
-      plan.budget >= JM_TAG_MAX_BUDGET
-    ) {
-      break;
-    }
-    plan.budget = Math.min(plan.budget + JM_TAG_GROW_STEP, JM_TAG_MAX_BUDGET);
+  // 单条件就是普通搜索: 走标签字段更准, 速度跟原来一样(一个请求一页)
+  if (terms.length === 1) {
+    const only = terms[0]!;
+    const response = (await jmRequest({
+      path: `${await getApiBaseUrl()}/search`,
+      method: "GET",
+      params: {
+        search_query: only.text,
+        page,
+        o: order,
+        ...(only.mainTag === 3 ? { main_tag: 3 } : {}),
+        ...(query.category ? { c: query.category } : {}),
+      },
+    })) as Record<string, any>;
+    const content = Array.isArray(response?.content) ? response.content : [];
+    return build(content, toNum(response?.total, content.length));
   }
 
-  // 只给还没出现过的本子, 避免列表变长后翻页重复
-  const fresh = verified.filter((item) => !seen.has(String(item?.id ?? "")));
-  const slice = fresh.slice(0, JM_SEARCH_PAGE_SIZE);
+  // 页预算: 条件越多每个条件分到的页越少, 总请求数控制在 32 个左右.
+  // 一次并发拉完(分多轮拉会叠加每轮的延迟), 翻页时再逐步加深.
+  const pagesPerTerm = Math.max(
+    6,
+    Math.floor(JM_TAG_PAGE_BUDGET_TOTAL / terms.length),
+  );
+  const targetBudget = pagesPerTerm * JM_SEARCH_PAGE_SIZE;
+  plan.budget =
+    page <= 1
+      ? targetBudget
+      : Math.min(plan.budget + JM_TAG_GROW_STEP, JM_TAG_MAX_BUDGET);
+
+  // 全部条件都是标签词时, 服务端已经按标签字段检索过了, 交集本身就是"同时带这些标签",
+  // 不用再逐本拉详情核对(那一步最贵). 有普通关键词时才核对, 保证关键词也真的命中.
+  const needVerify = terms.some((term) => term.mainTag !== 3);
+
+  const lists = await Promise.all(
+    terms.map(async (term) => {
+      const list = await loadSearchTermList(
+        term,
+        plan.budget,
+        query.category,
+        order,
+      );
+      if (list.items.length > 0 || term.mainTag !== 3) {
+        return list;
+      }
+      // 标签字段里没有这个词, 退回站内搜索再试一次
+      return loadSearchTermList(
+        { text: term.text, mainTag: 0 },
+        plan.budget,
+        query.category,
+        order,
+      );
+    }),
+  );
+  const exhausted = lists.every((list) => list.exhausted);
+
+  const idLists = lists.map((list) =>
+    list.items.map((item) => String(item?.id ?? "")).filter((id) => id.length > 0),
+  );
+  const interIds = intersectIdLists(idLists);
+
+  const itemById = new Map<string, any>();
+  for (const list of lists) {
+    for (const item of list.items) {
+      const id = String(item?.id ?? "");
+      if (id && !itemById.has(id)) {
+        itemById.set(id, item);
+      }
+    }
+  }
+
+  const candidates = interIds
+    .map((id) => itemById.get(id))
+    .filter((item) => Boolean(item));
+  const unseen = candidates.filter((item) => !seen.has(String(item?.id ?? "")));
+  const hasFreshCandidate = unseen.length > 0;
+
+  const results = needVerify
+    ? await filterByTagRules(unseen, conditionTerms, tagVerdicts)
+    : unseen;
+
+  const slice = results.slice(0, JM_SEARCH_PAGE_SIZE);
   for (const item of slice) {
     const id = String(item?.id ?? "");
     if (id) {
@@ -2318,10 +2364,9 @@ async function runTagSearch(input: {
     return null;
   }
 
-  const hasReachedMax =
-    slice.length === 0 || (fresh.length <= slice.length && exhausted);
+  const hasReachedMax = slice.length === 0 || (!hasFreshCandidate && exhausted);
 
-  return build(slice, verified.length, {
+  return build(slice, results.length, {
     hasReachedMax,
     extern: { tagSearch: plan },
   });

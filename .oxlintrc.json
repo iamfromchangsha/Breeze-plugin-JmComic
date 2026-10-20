@@ -9,6 +9,7 @@
     "node_modules/**",
     "dist/**",
     "verison/**",
+    "release/**",
     "build/**/*.cjs",
     "docs/**"
   ],

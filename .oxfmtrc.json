@@ -4,6 +4,7 @@
     "node_modules/**",
     "dist/**",
     "docs/**",
+    "release/**",
     "build/**/*.cjs",
     "test/fixtures/**",
     "tests/fixtures/**"
