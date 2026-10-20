@@ -33,14 +33,15 @@ https://github.com/iamfromchangsha/Breeze-plugin-JmComic/releases/latest/downloa
 ```
 
 > 国内网络如果 raw.githubusercontent 拉不动，App 会自动依次尝试 gh-proxy 镜像；
-> 也可以手动用 jsDelivr CDN（文件与上面完全一致，sha256 相同）：
+> 也可以手动用 jsDelivr CDN（文件与上面完全一致，sha256 相同）。
+> 用 **tag 固定地址**（`@v0.0.17`）而不是 `@main`，避免 CDN 缓存到旧版本：
 
 ```
-https://cdn.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@main/release/breeze-plugin-jm-comic.bundle.cjs
+https://cdn.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@v0.0.17/release/breeze-plugin-jm-comic.bundle.cjs
 ```
 
 ```
-https://fastly.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@main/release/breeze-plugin-jm-comic.bundle.cjs
+https://fastly.jsdelivr.net/gh/iamfromchangsha/Breeze-plugin-JmComic@v0.0.17/release/breeze-plugin-jm-comic.bundle.cjs
 ```
 
 ### 方式 B：本地安装
