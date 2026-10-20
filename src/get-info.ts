@@ -34,10 +34,11 @@ export function buildPluginInfo(input: BuildPluginInfoInput) {
     name: "禁漫天堂",
     uuid: JM_PLUGIN_ID,
     iconUrl: "https://raw.githubusercontent.com/deretame/Breeze-plugin-JmComic/main/assets/fO.webp",
-    describe: "禁漫天堂插件",
-    version: "0.0.15",
+    describe: "禁漫天堂插件（标签组合搜索增强版）",
+    version: "0.0.16",
     home: "https://github.com/deretame/Breeze-plugin-JmComic",
-    updateUrl: "https://api.github.com/repos/deretame/Breeze-plugin-JmComic/releases/latest",
+    updateUrl:
+      "https://api.github.com/repos/iamfromchangsha/Breeze-plugin-JmComic/releases/latest",
     npmName: "breeze-plugin-jm-comic",
     function: [
       {

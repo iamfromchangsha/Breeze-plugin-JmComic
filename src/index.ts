@@ -79,6 +79,17 @@ import {
   setRuntimeEndpointCache,
 } from "./state";
 import type { RequestPayload } from "./types";
+import {
+  albumMatchesTerm,
+  intersectIdLists,
+  mapWithConcurrency,
+  parseTagTaxonomy,
+  resolveTagQueryTerm,
+  splitTagTerms,
+  JM_COMMON_TAGS,
+  type AlbumSearchFields,
+  type JmTagTaxonomy,
+} from "./tag-search";
 import { md5Hex } from "./utils";
 
 const JM_PLUGIN_ID = "bf99008d-010b-4f17-ac7c-61a9b57dc3d9";
@@ -1480,10 +1491,372 @@ async function getRankingFilterBundle(): Promise<FilterBundleContract> {
   };
 }
 
+/** 标签组合搜索: 并发拉分页的并发数. */
+const JM_TAG_PAGE_CONCURRENCY = 6;
+/** 禁漫 /search 每页固定条数. */
+const JM_SEARCH_PAGE_SIZE = 80;
+/** 标签组合搜索: 每个检索词首次拉取的条数上限. */
+const JM_TAG_TERM_BUDGET = 8 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 结果不够时每次再扩多少条. */
+const JM_TAG_GROW_STEP = 8 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 拉取条数上限, 再大就没必要了. */
+const JM_TAG_MAX_BUDGET = 100 * JM_SEARCH_PAGE_SIZE;
+/** 标签组合搜索: 并发核对本子详情的并发数. */
+const JM_TAG_DETAIL_CONCURRENCY = 8;
+
+type TagTerm = { text: string; mainTag: 0 | 3 };
+
+type TagSearchPlan = {
+  /** 查询指纹, 变了就从头开始 */
+  key: string;
+  terms: TagTerm[];
+  /** 每个检索词拉取的条数上限 */
+  budget: number;
+  /** 已经吐给上层的本子 id, 用来避免翻页重复 */
+  seen: string[];
+};
+
+type SearchTermList = {
+  items: any[];
+  total: number;
+  /** 服务端已经翻到最后一页 */
+  exhausted: boolean;
+};
+
+type TagQuery = {
+  /** AND 条件词 */
+  terms: string[];
+  /** 来自高级搜索勾选的标签(用来判断能否回退到普通搜索) */
+  picked: string[];
+  /** 分类 slug, 对应搜索接口的 c 参数 */
+  category: string;
+};
+
+let tagTaxonomy: JmTagTaxonomy | null = null;
+let tagTaxonomyPromise: Promise<JmTagTaxonomy> | null = null;
+let knownTagIndex: { normalized: Set<string> } | null = null;
+const termListCache = new Map<string, SearchTermList>();
+const albumMetaCache = new Map<string, AlbumSearchFields>();
+const tagSimplifyCache = new Map<string, string>();
+
+/** 同步归一化(不含繁简转换). */
+function syncNormalize(value: string): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+/** 繁简统一, 带缓存(本子标签词表很小, 命中率很高). */
+async function simplifyTagText(value: string): Promise<string> {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+  const hit = tagSimplifyCache.get(raw);
+  if (hit !== undefined) {
+    return hit;
+  }
+  let out = raw;
+  try {
+    out = String(await opencc.convert(raw, "t2s.json")).trim();
+  } catch {
+    out = raw;
+  }
+  tagSimplifyCache.set(raw, out);
+  return out;
+}
+
+/** 标签体系(来自禁漫 /categories), 进程内缓存. */
+async function loadTagTaxonomy(): Promise<JmTagTaxonomy> {
+  if (tagTaxonomy) {
+    return tagTaxonomy;
+  }
+  if (!tagTaxonomyPromise) {
+    tagTaxonomyPromise = (async () => {
+      try {
+        const response = await jmRequest({
+          path: `${await getApiBaseUrl()}/categories`,
+          method: "GET",
+        });
+        const taxonomy = parseTagTaxonomy(response);
+        if (taxonomy.tags.length > 0) {
+          tagTaxonomy = taxonomy;
+          knownTagIndex = null;
+        }
+        return taxonomy;
+      } catch (err) {
+        console.warn("[jm] 加载标签体系失败", err);
+        return tagTaxonomy ?? { groups: [], tags: [], categories: [] };
+      } finally {
+        tagTaxonomyPromise = null;
+      }
+    })();
+  }
+  return tagTaxonomyPromise;
+}
+
+/** 已知标签索引: 官方主题标签 + 常用标签, 用来判断一个词该不该按标签检索. */
+async function loadKnownTagIndex(): Promise<{ normalized: Set<string> }> {
+  if (knownTagIndex) {
+    return knownTagIndex;
+  }
+  const taxonomy = await loadTagTaxonomy();
+  const normalized = new Set<string>();
+  for (const tag of [...taxonomy.tags, ...JM_COMMON_TAGS]) {
+    normalized.add(syncNormalize(await simplifyTagText(tag)));
+  }
+  knownTagIndex = { normalized };
+  return knownTagIndex;
+}
+
+/**
+ * 常用标签选项(去重掉官方主题标签里已有的).
+ *
+ * 去重要跨简繁: 禁漫的 /categories 节点有时回繁体(劇情向), 有时回简体(剧情向),
+ * 直接比字符串会漏掉一半的重叠, 常用标签列表就会多出一堆重复项.
+ */
+let commonTagOptionsCache: { label: string; value: string }[] | null = null;
+
+async function loadCommonTagOptions(): Promise<{ label: string; value: string }[]> {
+  if (commonTagOptionsCache) {
+    return commonTagOptionsCache;
+  }
+  const taxonomy = await loadTagTaxonomy();
+  const themeTags = new Set<string>();
+  for (const tag of taxonomy.tags) {
+    themeTags.add(syncNormalize(await simplifyTagText(tag)));
+  }
+
+  const options: { label: string; value: string }[] = [];
+  for (const tag of JM_COMMON_TAGS) {
+    if (themeTags.has(syncNormalize(await simplifyTagText(tag)))) {
+      continue;
+    }
+    options.push({ label: tag, value: tag });
+  }
+
+  commonTagOptionsCache = options;
+  return options;
+}
+
+/** 拉某个检索词的结果集(按页并发拉, 进程内缓存). */
+async function loadSearchTermList(
+  term: TagTerm,
+  budget: number,
+  category: string,
+  order: string,
+): Promise<SearchTermList> {
+  const key = `${term.mainTag}:${term.text}:${category}:${order}`;
+  let entry = termListCache.get(key);
+  if (!entry) {
+    entry = { items: [], total: 0, exhausted: false };
+    termListCache.set(key, entry);
+  }
+  if (entry.exhausted || entry.items.length >= budget) {
+    return entry;
+  }
+
+  const startPage = Math.floor(entry.items.length / JM_SEARCH_PAGE_SIZE) + 1;
+  const need = Math.ceil((budget - entry.items.length) / JM_SEARCH_PAGE_SIZE);
+  const pageNumbers: number[] = [];
+  for (let i = 0; i < need; i++) {
+    pageNumbers.push(startPage + i);
+  }
+
+  const responses = await mapWithConcurrency(
+    pageNumbers,
+    JM_TAG_PAGE_CONCURRENCY,
+    async (page) => {
+      const params: Record<string, unknown> = {
+        search_query: term.text,
+        page,
+        o: order,
+      };
+      if (term.mainTag !== 0) {
+        params.main_tag = term.mainTag;
+      }
+      if (category) {
+        params.c = category;
+      }
+      const response = (await jmRequest({
+        path: `${await getApiBaseUrl()}/search`,
+        method: "GET",
+        params,
+      })) as Record<string, any>;
+      return response;
+    },
+  );
+
+  for (const response of responses) {
+    const content = Array.isArray(response?.content) ? response.content : [];
+    entry.total = Math.max(entry.total, toNum(response?.total, 0));
+    if (content.length === 0) {
+      entry.exhausted = true;
+      continue;
+    }
+    entry.items.push(...content);
+    if (content.length < JM_SEARCH_PAGE_SIZE) {
+      entry.exhausted = true;
+    }
+  }
+
+  return entry;
+}
+
+/** 本子详情(标题/作者/标签/作品/角色), 进程内缓存, 字段已统一成简体. */
+async function fetchAlbumMeta(comicId: string): Promise<AlbumSearchFields> {
+  const id = String(comicId ?? "").trim();
+  if (!id) {
+    return {};
+  }
+  const hit = albumMetaCache.get(id);
+  if (hit) {
+    return hit;
+  }
+  const response = (await jmRequest({
+    path: `${await getApiBaseUrl()}/album`,
+    method: "GET",
+    params: { id },
+  })) as Record<string, any>;
+  const meta: AlbumSearchFields = {
+    name: await simplifyTagText(String(response?.name ?? "")),
+    author: await Promise.all(toStrList(response?.author).map(simplifyTagText)),
+    tags: await Promise.all(toStrList(response?.tags).map(simplifyTagText)),
+    works: await Promise.all(toStrList(response?.works).map(simplifyTagText)),
+    actors: await Promise.all(toStrList(response?.actors).map(simplifyTagText)),
+  };
+  albumMetaCache.set(id, meta);
+  return meta;
+}
+
+/** 判定这次搜索是不是"多条件"模式, 是的话给出条件词与分类. */
+async function resolveTagQuery(
+  extern: Record<string, unknown>,
+  keyword: string,
+): Promise<TagQuery | null> {
+  // 高级搜索里所有 tags 开头的字段都是勾选出来的条件
+  const picked: string[] = [];
+  for (const [key, value] of Object.entries(extern)) {
+    if (!key.startsWith("tags")) {
+      continue;
+    }
+    for (const item of toStrList(value)) {
+      if (item && !picked.includes(item)) {
+        picked.push(item);
+      }
+    }
+  }
+
+  const terms: string[] = [];
+  for (const term of [...picked, ...splitTagTerms(keyword)]) {
+    const value = String(term ?? "").trim();
+    if (value && !terms.includes(value)) {
+      terms.push(value);
+    }
+  }
+  if (!terms.length) {
+    return null;
+  }
+
+  return {
+    terms,
+    picked,
+    category: String(extern.category ?? "").trim(),
+  };
+}
+
+/** 逐本核对: 本子是否同时满足所有条件词. */
+async function filterByTagRules(
+  candidates: any[],
+  terms: string[],
+): Promise<any[]> {
+  if (!candidates.length) {
+    return [];
+  }
+
+  const metas = await mapWithConcurrency(
+    candidates,
+    JM_TAG_DETAIL_CONCURRENCY,
+    async (item) => {
+      try {
+        return await fetchAlbumMeta(String(item?.id ?? ""));
+      } catch (err) {
+        console.warn("[jm] 拉本子详情失败", err);
+        return null;
+      }
+    },
+  );
+
+  const kept: any[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const meta = metas[i];
+    if (!meta) {
+      continue;
+    }
+    if (!terms.every((term) => albumMatchesTerm(meta, term, syncNormalize))) {
+      continue;
+    }
+    kept.push(candidates[i]);
+  }
+  return kept;
+}
+
+function toTagSearchPlan(value: unknown): TagSearchPlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const key = String(record.key ?? "");
+  const terms = Array.isArray(record.terms) ? record.terms : [];
+  if (!key || !terms.length) {
+    return null;
+  }
+  const parsedTerms: TagTerm[] = [];
+  for (const item of terms) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const term = item as Record<string, unknown>;
+    const text = String(term.text ?? "").trim();
+    if (!text) {
+      continue;
+    }
+    parsedTerms.push({
+      text,
+      mainTag: toNum(term.mainTag, 0) === 3 ? 3 : 0,
+    });
+  }
+  if (!parsedTerms.length) {
+    return null;
+  }
+  return {
+    key,
+    terms: parsedTerms,
+    budget: Math.max(JM_SEARCH_PAGE_SIZE, toNum(record.budget, JM_TAG_TERM_BUDGET)),
+    seen: Array.isArray(record.seen) ? record.seen.map((id) => String(id)) : [],
+  };
+}
+
 async function getAdvancedSearchScheme(
   payload: { extern?: Record<string, unknown> } = {},
 ): Promise<AdvancedSearchContract> {
   const extern = toStringMap(payload.extern);
+  const taxonomy = await loadTagTaxonomy();
+  const categoryOptions = [
+    { label: "全部", value: "" },
+    ...taxonomy.categories.map((item) => ({ label: item.label, value: item.value })),
+  ];
+
+  // 标签分成多组多选, 免得一个下拉里塞一百多项
+  const tagFields = taxonomy.groups.map((group, index) => ({
+    key: `tags_group_${index + 1}`,
+    kind: "multiChoice" as const,
+    label: group.title,
+    options: group.tags.map((tag) => ({ label: tag, value: tag })),
+  }));
+
+  const commonTags = await loadCommonTagOptions();
+
   return {
     source: JM_PLUGIN_ID,
     scheme: {
@@ -1501,11 +1874,25 @@ async function getAdvancedSearchScheme(
             { label: "最多点赞", value: 4 },
           ],
         },
+        {
+          key: "category",
+          kind: "choice",
+          label: "分类",
+          options: categoryOptions,
+        },
+        ...tagFields,
+        {
+          key: "tags_common",
+          kind: "multiChoice",
+          label: "常用标签",
+          options: commonTags,
+        },
       ],
     },
     data: {
       values: {
         sortBy: toNum(extern.sortBy, 1),
+        category: String(extern.category ?? ""),
       },
     },
   };
@@ -1809,6 +2196,137 @@ async function getComicDetail(payload: ComicDetailPayload = {}): Promise<ComicDe
     data,
   };
 }
+type SearchResultBuilder = (
+  content: any[],
+  total: number,
+  override?: { hasReachedMax?: boolean; extern?: Record<string, unknown> },
+) => SearchResultContract;
+
+/**
+ * 多条件(标签组合)搜索.
+ *
+ * 禁漫服务端没有多条件过滤能力, 所以这里做的是:
+ * 1. 每个条件词各拉一份结果集(标签词走 main_tag=3 走标签字段, 其它词走站内搜索);
+ * 2. 结果集求交集 —— 交集里的本子必然同时命中所有条件;
+ * 3. 逐本核对详情兜底(标签名带后缀时"互相包含"才认);
+ * 4. 交集不够就把检索词的前缀拉得更长, 直到拉完或翻满上限.
+ */
+async function runTagSearch(input: {
+  query: TagQuery;
+  extern: Record<string, unknown>;
+  page: number;
+  order: string;
+  build: SearchResultBuilder;
+}): Promise<SearchResultContract | null> {
+  const { query, extern, page, order, build } = input;
+  const index = await loadKnownTagIndex();
+  // 条件词统一成简体再检索/核对: 禁漫的标签有时简体有时繁体
+  const conditionTerms = await Promise.all(
+    query.terms.map((term) => simplifyTagText(resolveTagQueryTerm(term))),
+  );
+
+  const terms: TagTerm[] = query.terms.map((_, i) => ({
+    text: conditionTerms[i] ?? "",
+    // 词在标签表里就按标签字段检索(main_tag=3), 否则走站内搜索
+    mainTag: index.normalized.has(syncNormalize(conditionTerms[i] ?? "")) ? 3 : 0,
+  }));
+
+  const planKey = JSON.stringify({
+    terms: terms.map((term) => [term.text, term.mainTag]),
+    category: query.category,
+  });
+
+  let plan = toTagSearchPlan(extern.tagSearch);
+  if (!plan || plan.key !== planKey) {
+    plan = { key: planKey, terms, budget: JM_TAG_TERM_BUDGET, seen: [] };
+  }
+  if (page <= 1) {
+    plan.seen = [];
+  }
+  const seen = new Set(plan.seen);
+
+  let verified: any[] = [];
+  let exhausted = false;
+
+  while (true) {
+    const lists = await Promise.all(
+      terms.map(async (term) => {
+        const list = await loadSearchTermList(
+          term,
+          plan.budget,
+          query.category,
+          order,
+        );
+        if (list.items.length > 0 || term.mainTag !== 3) {
+          return list;
+        }
+        // 标签字段里没有这个词, 退回站内搜索再试一次
+        return loadSearchTermList(
+          { text: term.text, mainTag: 0 },
+          plan.budget,
+          query.category,
+          order,
+        );
+      }),
+    );
+    exhausted = lists.every((list) => list.exhausted);
+
+    const idLists = lists.map((list) =>
+      list.items.map((item) => String(item?.id ?? "")).filter((id) => id.length > 0),
+    );
+    const interIds = intersectIdLists(idLists);
+
+    const itemById = new Map<string, any>();
+    for (const list of lists) {
+      for (const item of list.items) {
+        const id = String(item?.id ?? "");
+        if (id && !itemById.has(id)) {
+          itemById.set(id, item);
+        }
+      }
+    }
+
+    const candidates = interIds
+      .map((id) => itemById.get(id))
+      .filter((item) => Boolean(item));
+
+    verified = await filterByTagRules(candidates, conditionTerms);
+
+    if (
+      verified.some((item) => !seen.has(String(item?.id ?? ""))) ||
+      exhausted ||
+      plan.budget >= JM_TAG_MAX_BUDGET
+    ) {
+      break;
+    }
+    plan.budget = Math.min(plan.budget + JM_TAG_GROW_STEP, JM_TAG_MAX_BUDGET);
+  }
+
+  // 只给还没出现过的本子, 避免列表变长后翻页重复
+  const fresh = verified.filter((item) => !seen.has(String(item?.id ?? "")));
+  const slice = fresh.slice(0, JM_SEARCH_PAGE_SIZE);
+  for (const item of slice) {
+    const id = String(item?.id ?? "");
+    if (id) {
+      seen.add(id);
+      plan.seen.push(id);
+    }
+  }
+
+  // 条件没拆出来(比如关键词里带 + 但不是标签), 结果又为空, 交给普通搜索兜底
+  if (slice.length === 0 && page <= 1 && query.picked.length === 0) {
+    return null;
+  }
+
+  const hasReachedMax =
+    slice.length === 0 || (fresh.length <= slice.length && exhausted);
+
+  return build(slice, verified.length, {
+    hasReachedMax,
+    extern: { tagSearch: plan },
+  });
+}
+
 async function searchComic(payload: JmSearchPayload = {}): Promise<SearchResultContract> {
   const extern = toStringMap(payload.extern);
   const imageBase = await getImageBaseUrl();
@@ -1817,8 +2335,12 @@ async function searchComic(payload: JmSearchPayload = {}): Promise<SearchResultC
   const keywordLower = keyword.toLowerCase();
   const order = String(extern.sort ?? sortByToOrder(extern.sortBy)).trim();
   const path = `${await getApiBaseUrl()}/search`;
-  const searchPageSize = 80;
-  const buildResult = (content: any[], total: number): SearchResultContract => {
+  const searchPageSize = JM_SEARCH_PAGE_SIZE;
+  const buildResult = (
+    content: any[],
+    total: number,
+    override?: { hasReachedMax?: boolean; extern?: Record<string, unknown> },
+  ): SearchResultContract => {
     const scheme = {
       version: "1.0.0" as const,
       type: "searchResult" as const,
@@ -1832,9 +2354,10 @@ async function searchComic(payload: JmSearchPayload = {}): Promise<SearchResultC
         pages: page,
         total,
         hasReachedMax:
-          content.length === 0 ||
-          content.length < searchPageSize ||
-          (total > 0 && (page - 1) * searchPageSize + content.length >= total),
+          override?.hasReachedMax ??
+          (content.length === 0 ||
+            content.length < searchPageSize ||
+            (total > 0 && (page - 1) * searchPageSize + content.length >= total)),
       },
       items: content.map((item: any) => toComicItem(item, imageBase)),
     };
@@ -1844,6 +2367,7 @@ async function searchComic(payload: JmSearchPayload = {}): Promise<SearchResultC
       extern: {
         ...extern,
         sortBy: toNum(extern.sortBy, 1),
+        ...override?.extern,
       },
       scheme,
       data,
@@ -1878,6 +2402,21 @@ async function searchComic(payload: JmSearchPayload = {}): Promise<SearchResultC
       } catch {
         // ignore direct-id fallback failure and continue with normal search
       }
+    }
+  }
+
+  // 多条件: 关键词里的 "A+B", 或高级搜索里勾选的标签
+  const tagQuery = await resolveTagQuery(extern, keyword);
+  if (tagQuery) {
+    const tagResult = await runTagSearch({
+      query: tagQuery,
+      extern,
+      page,
+      order,
+      build: buildResult,
+    });
+    if (tagResult) {
+      return tagResult;
     }
   }
 

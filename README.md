@@ -1,0 +1,136 @@
+# 禁漫天堂插件（Breeze）· 标签组合搜索增强版
+
+> 派生自 [`deretame/Breeze-plugin-JmComic`](https://github.com/deretame/Breeze-plugin-JmComic)（原作者 deretame）。
+> 本仓库只增加「标签组合搜索」能力，其余功能与上游保持一致。
+
+给 Breeze 的「禁漫天堂」源加上多标签 **AND** 搜索：搜出来的本子**同时**带齐你选的所有标签。
+
+- 搜索框直接写：`后宫+校园`
+- 或在搜索页点右上角 **调节（调音图标）** 按钮，勾选标签后应用
+
+---
+
+## 一、怎么装（手机端）
+
+### 方式 A：网络安装（推荐，手机上一步到位）
+
+Breeze → 插件 → 插件商店 → **网络安装**，粘贴下面任一地址：
+
+```
+https://raw.githubusercontent.com/iamfromchangsha/Breeze-plugin-JmComic/main/release/breeze-plugin-jm-comic.bundle.cjs
+```
+
+或（体积更小，约 34KB，App 会自动 brotli 解压）：
+
+```
+https://raw.githubusercontent.com/iamfromchangsha/Breeze-plugin-JmComic/main/release/breeze-plugin-jm-comic.bundle.cjs.br
+```
+
+或走 GitHub Release 资产：
+
+```
+https://github.com/iamfromchangsha/Breeze-plugin-JmComic/releases/latest/download/breeze-plugin-jm-comic.bundle.cjs
+```
+
+### 方式 B：本地安装
+
+1. 在 Release 页面下载 `breeze-plugin-jm-comic.bundle.cjs`（或本仓库 `release/` 目录里的文件）
+2. 传到手机，用文件管理器打开
+3. Breeze → 插件 → 插件商店 → **本地安装**，选中该文件
+
+> ⚠️ **如果之前已经装了官方「禁漫天堂」，必须先卸载/删除再装**。
+> 插件 UUID 相同，App 不允许重复安装，会报「插件已存在，禁止重复安装」。
+> （插件管理页删除后，商店里的「云端组件」仍可重新装回官方版。）
+
+> ℹ️ 本插件的自动更新源已指向本仓库的 Release，官方发新版本**不会**覆盖这个改动；
+> 但你也可以随时从插件商店重新安装官方版覆盖回来。
+
+---
+
+## 二、两种用法
+
+### 用法 A：搜索框直接写加号
+
+```
+后宫+校园
+```
+
+多个标签用 `+` 连接（也支持全角 `＋`），结果是**同时**带这两个标签的本子。
+
+### 用法 B：高级搜索里勾选标签
+
+搜索页点右上角 **调节（调音图标）** 按钮：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| 排序 | 单选 | 从新到旧 / 最多观看 / 最多图片 / 最多点赞 |
+| 分类 | 单选 | 全部 / 同人 / 单本 / 短篇 / 其他类 / 韩漫 / 美漫 / Cosplay / 3D / 禁漫汉化组 |
+| 主题A漫 | 多选 | 禁漫官方主题标签（剧情向 / 校园 / 纯爱 / 人妻 / 师生 / 近亲 / 百合 / YAOI / 性转 / NTR / 伪娘 / 痴女 / 全彩 / 女性向） |
+| 角色 / 扮演 | 多选 | 萝莉 / 御姐 / 熟女 / 正太 / 巨乳 / 贫乳 / 女王 / 教师 / 女僕 / 护士 / 泳装 / 眼镜 / 连裤袜 / 其他制服 / 兔女郎 |
+| 特殊PLAY | 多选 | 群交 / 足交 / SM / 肛交 / 阿黑颜 / 药物 / 扶他 / 调教 / 野外露出 / 催眠 / 自慰 / 触手 / 兽交 |
+| 其他 | 多选 | CG集 / 重口 / 猎奇 / 非H / 血腥暴力 |
+| 常用标签 | 多选 | 按真实出现频次排的高频标签（后宫 / 中出 / 校服 / 透视 / 乱伦 / 束缚 / 怀孕 / 手淫 …） |
+
+可以跨分组勾多个标签。搜索框里写关键词 + 勾选标签可以组合使用，等价于「关键词 AND 这些标签」。
+
+---
+
+## 三、为什么这么绕（服务端限制）
+
+禁漫移动端 API 的 `/search` **没有**多标签过滤参数。2026-10 实测结论：
+
+| 参数 | 效果 |
+| --- | --- |
+| `search_query` | 有效，但多个词之间是 **OR**（`后宫 校园` = 7069 条，是两者并集） |
+| `c` | 有效，单个分类 slug（`c=doujin` / `c=single`） |
+| `main_tag` | 有效，0=站内 1=作品 2=作者 3=标签 |
+| `c[]` / `tags[]` / `tag[]` / `t=` | **全部无效**（传了跟没传一样） |
+
+所以「同时命中多个标签」只能在客户端做。插件的做法是：
+
+1. 每个条件各拉一份结果集（标签词走 `main_tag=3` 走标签字段，普通词走站内搜索）
+2. **结果集求交集** —— 交集里的本子必然同时命中所有条件
+3. 再逐本拉 `/album` 核对标签兜底（处理「近亲 vs 近亲相姦」「YAOI vs yaoi」「自慰 vs 手淫」「全彩 vs 全採」这类写法差异）
+4. 交集不够就把检索词的前缀继续往后拉，自动扩展
+
+实测「后宫+校园」：候选 640×2 条 → 交集 10 条 → 逐本核对 **10/10 全部同时带两个标签**（准确率 100%）。
+
+---
+
+## 四、已知限制
+
+- **首次搜索要 2~5 秒**：要多拉几页结果集做交集，比普通搜索慢
+- **覆盖度随翻页提升**：交集只覆盖各标签结果集的前缀，往下翻插件会继续往后拉，翻得越多越全
+- **词不在标签表里时按普通词处理**：比如 `MANA` 不在标签表里，会走站内搜索并按作者/标题匹配
+- **官方主题标签只有 47 个**，实际本子标签有近 900 个，本仓库内置了 86 个高频的（`后宫`、`中出`、`校服` 这些官方主题列表里根本没有）
+- **别名**：`自慰` 在本子里实际写的是 `手淫`，已做映射
+- **简繁**：禁漫的 `/categories` 节点有时回繁体（劇情向）有时回简体（剧情向），插件内部统一转简体后再比对
+
+---
+
+## 五、开发
+
+```bash
+# 依赖
+pnpm install
+
+# 类型检查 + 打包(含 manifest / version 同步 / brotli)
+pnpm build
+
+# 离线单测(25 项, 不联网)
+node --import tsx test/tag-search.test.ts
+```
+
+改动集中在：
+
+- `src/tag-search.ts`（新增）：条件词拆分、标签体系解析、交集运算、标签匹配、别名表
+- `src/index.ts`：`searchComic` 多条件 AND 分支、`getAdvancedSearchScheme` 标签多选字段
+- `test/tag-search.test.ts`（新增）：纯逻辑单测
+
+---
+
+## 六、致谢
+
+- 上游项目与版权：[`deretame/Breeze-plugin-JmComic`](https://github.com/deretame/Breeze-plugin-JmComic)
+- 宿主 App：[`deretame/Breeze`](https://github.com/deretame/Breeze)
+- 插件开发工具包：`breeze-plugin-kit`
